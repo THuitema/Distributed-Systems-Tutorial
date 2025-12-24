@@ -2,75 +2,134 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
+	"slices"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
 /*
-Challenge #3a
+Challenge #3: Broadcast
 */
 
 // Broadcast RPC
-type BroadcastRequest struct {
-	Type    string  `json:"type"`
-	Message int     `json:"message"`
+type BroadcastRequestBody struct {
+	Type    string `json:"type"`
+	Message int    `json:"message"`
+}
+
+type BroadcastOkBody struct {
+	Type      string `json:"type"`
+	InReplyTo int    `json:"in_reply_to"`
+}
+
+type BroadcastResponseBody struct {
+	Type string `json:"type"`
+}
+
+// Read RPC
+type ReadRequestBody struct {
+	Type string `json:"type"`
+}
+
+type ReadResponseBody struct {
+	Type     string `json:"type"`
+	Messages []int `json:"messages"`
 }
 
 // Topology RPC
-type TopologyRequest struct {
+type TopologyRequestBody struct {
 	Type     string              `json:"type"`
 	Topology map[string][]string `json:"topology"`
+}
+
+type TopologyResponseBody struct {
+	Type string              `json:"type"`
 }
 
 func main() {
 	n := maelstrom.NewNode()
 	var messages []int
-	var topology map[string][]string
-
+	var destinations []string
 
 	// This message requests that a value be broadcast out to all nodes in the cluster
 	// Always an integer and unique
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
 		// Unmarshal the message body into a map
-		var body BroadcastRequest
+		var body BroadcastRequestBody
 
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
 
+		// Stop broadcasting if we already received message
+		if slices.Contains(messages, body.Message) {
+			return n.Reply(msg, BroadcastResponseBody{
+				Type: "broadcast_ok",
+			})
+		}
+
 		messages = append(messages, body.Message)
 
-		responseBody := make(map[string]any)
-		responseBody["type"] = "broadcast_ok"
+		// Broadcast message to adjacent nodes
+		for _, node := range destinations {
+			// Use RPC since we expect a broadcast_ok
+			n.RPC(node, body, func(msg maelstrom.Message) error {
+				var broadcastOkBody BroadcastOkBody
 
-		return n.Reply(msg, responseBody)
+				if err := json.Unmarshal(msg.Body, &broadcastOkBody); err != nil {
+					return err
+				}
+
+				if broadcastOkBody.Type != "broadcast_ok" {
+					return fmt.Errorf("expected type broadcast_ok, got %s", broadcastOkBody.Type)
+				}
+
+				return nil
+			})
+		}
+
+		return n.Reply(msg, BroadcastResponseBody{
+			Type: "broadcast_ok",
+		})
+	})
+
+	n.Handle("broadcast_ok", func(msg maelstrom.Message) error {
+		return nil
 	})
 
 	// This message requests that a node return all values it has seen
 	n.Handle("read", func(msg maelstrom.Message) error {
-		responseBody := make(map[string]any)
+		// Unmarshal the message body as an loosely-typed map.
+		var body ReadRequestBody
 
-		responseBody["type"] = "read_ok"
-		responseBody["messages"] = messages
-		return n.Reply(msg, responseBody)
+		if err := json.Unmarshal(msg.Body, &body); err != nil {
+			return err
+		}
+
+		return n.Reply(msg, ReadResponseBody{
+			Type:     "read_ok",
+			Messages: messages,
+		})
 	})
 
 	// This message informs the node of who its neighboring nodes are
 	n.Handle("topology", func(msg maelstrom.Message) error {
 		// Unmarshal the message body into a map
-		var body TopologyRequest
+		var body TopologyRequestBody
 
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
 
-		topology = body.Topology
-		_ = topology // just so it compiles for now. remove when we actually read topology
+		destinations = body.Topology[n.ID()]
 
-		responseBody := make(map[string]any)
-		responseBody["type"] = "topology_ok"
-		return n.Reply(msg, responseBody)
+		log.Print("Topology received!")
+
+		return n.Reply(msg, TopologyResponseBody{
+			Type: "topology_ok",
+		})
 	})
 
 	if err := n.Run(); err != nil {
