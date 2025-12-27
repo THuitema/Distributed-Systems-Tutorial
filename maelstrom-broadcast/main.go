@@ -14,6 +14,18 @@ import (
 
 /*
 Challenge #3: Broadcast
+
+Benchmarks:
+
+Grid Topology:
+  Messages-per-op: 53.56
+  Median Latency: 451 ms
+  Max Latency: 799 ms
+
+Line Topology:
+  Messages-per-op: 23.56
+  Median Latency: 1572
+  Max Latency: 2433
 */
 
 // Broadcast RPC
@@ -79,14 +91,13 @@ func main() {
 			})
 		}
 
-		go func(adjacencies []string, body BroadcastRequestBody) {
-			var deliveredNodes []string
+		// what if we make a thread for each attempted broadcast
+		for _, adjNode := range destinations {
+			if adjNode != msg.Src {
+				go func(adjNode string, body BroadcastRequestBody) {
+					delivered := false
 
-			for len(deliveredNodes) < len(adjacencies) {
-				for _, adjNode := range adjacencies {
-					if !slices.Contains(deliveredNodes, adjNode) {
-
-						// Use RPC since we expect a broadcast_ok
+					for !delivered {
 						n.RPC(adjNode, body, func(msg maelstrom.Message) error {
 							var broadcastOkBody BroadcastOkBody
 
@@ -99,16 +110,15 @@ func main() {
 							}
 
 							// Mark node as delivered
-							deliveredNodes = append(deliveredNodes, adjNode)
+							delivered = true
 							return nil
 						})
-					}
-				}
 
-				// Wait between repeated broadcast attempts to the same node
-				time.Sleep(time.Second)
+						time.Sleep(time.Second)
+					}
+				}(adjNode, body)
 			}
-		}(destinations, body)
+		}
 
 		return n.Reply(msg, BroadcastResponseBody{
 			Type: "broadcast_ok",
@@ -181,3 +191,5 @@ func (c *SafeMessageMap) KeyList() []int {
 	defer c.mu.Unlock()
 	return slices.Collect(maps.Keys(c.v))
 }
+
+
