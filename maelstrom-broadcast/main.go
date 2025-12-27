@@ -4,7 +4,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"maps"
 	"slices"
+	"sync"
+	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
@@ -35,7 +38,7 @@ type ReadRequestBody struct {
 
 type ReadResponseBody struct {
 	Type     string `json:"type"`
-	Messages []int `json:"messages"`
+	Messages []int  `json:"messages"`
 }
 
 // Topology RPC
@@ -45,13 +48,19 @@ type TopologyRequestBody struct {
 }
 
 type TopologyResponseBody struct {
-	Type string              `json:"type"`
+	Type string `json:"type"`
+}
+
+type SafeMessageMap struct {
+	mu sync.Mutex
+	v  map[int]bool
 }
 
 func main() {
 	n := maelstrom.NewNode()
-	var messages []int
 	var destinations []string
+
+	messageMap := SafeMessageMap{v: make(map[int]bool)}
 
 	// This message requests that a value be broadcast out to all nodes in the cluster
 	// Always an integer and unique
@@ -64,31 +73,42 @@ func main() {
 		}
 
 		// Stop broadcasting if we already received message
-		if slices.Contains(messages, body.Message) {
+		if messageMap.Exists(body.Message) {
 			return n.Reply(msg, BroadcastResponseBody{
 				Type: "broadcast_ok",
 			})
 		}
 
-		messages = append(messages, body.Message)
+		go func(adjacencies []string, body BroadcastRequestBody) {
+			var deliveredNodes []string
 
-		// Broadcast message to adjacent nodes
-		for _, node := range destinations {
-			// Use RPC since we expect a broadcast_ok
-			n.RPC(node, body, func(msg maelstrom.Message) error {
-				var broadcastOkBody BroadcastOkBody
+			for len(deliveredNodes) < len(adjacencies) {
+				for _, adjNode := range adjacencies {
+					if !slices.Contains(deliveredNodes, adjNode) {
 
-				if err := json.Unmarshal(msg.Body, &broadcastOkBody); err != nil {
-					return err
+						// Use RPC since we expect a broadcast_ok
+						n.RPC(adjNode, body, func(msg maelstrom.Message) error {
+							var broadcastOkBody BroadcastOkBody
+
+							if err := json.Unmarshal(msg.Body, &broadcastOkBody); err != nil {
+								return err
+							}
+
+							if broadcastOkBody.Type != "broadcast_ok" {
+								return fmt.Errorf("expected type broadcast_ok, got %s", broadcastOkBody.Type)
+							}
+
+							// Mark node as delivered
+							deliveredNodes = append(deliveredNodes, adjNode)
+							return nil
+						})
+					}
 				}
 
-				if broadcastOkBody.Type != "broadcast_ok" {
-					return fmt.Errorf("expected type broadcast_ok, got %s", broadcastOkBody.Type)
-				}
-
-				return nil
-			})
-		}
+				// Wait between repeated broadcast attempts to the same node
+				time.Sleep(time.Second)
+			}
+		}(destinations, body)
 
 		return n.Reply(msg, BroadcastResponseBody{
 			Type: "broadcast_ok",
@@ -108,9 +128,11 @@ func main() {
 			return err
 		}
 
+		keys := messageMap.KeyList()
+
 		return n.Reply(msg, ReadResponseBody{
 			Type:     "read_ok",
-			Messages: messages,
+			Messages: keys,
 		})
 	})
 
@@ -124,6 +146,7 @@ func main() {
 		}
 
 		destinations = body.Topology[n.ID()]
+		_ = destinations
 
 		log.Print("Topology received!")
 
@@ -135,4 +158,26 @@ func main() {
 	if err := n.Run(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// Returns true if we have already received the given message
+// If message doesn't exist, we add it to our list
+// Locks so only one goroutine can access the map
+func (c *SafeMessageMap) Exists(message int) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, exists := c.v[message]
+
+	if !exists {
+		c.v[message] = true
+	}
+
+	return exists
+}
+
+// Returns list of keys in messageMap
+func (c *SafeMessageMap) KeyList() []int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Collect(maps.Keys(c.v))
 }
