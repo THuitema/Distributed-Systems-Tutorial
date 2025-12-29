@@ -6,12 +6,15 @@ Challenge #5: Kafka-Style Log
 Goal: implement a replicated log service similar to Kafka
 
 Part a) Single-node log system
+Part b) Distributed log system utilizing a linearizable key-value service
 */
 
 import (
 	"encoding/json"
 	"log"
-	"sync"
+	"context"
+	"errors"
+	"fmt"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
@@ -56,29 +59,12 @@ type ListCommittedOffsetsResponseBody struct {
 	Offsets map[string]int `json:"offsets"`
 }
 
-type ThreadSafeLog struct {
-	mu   sync.Mutex
-	logs map[string]*Log
-}
-
-type Log struct {
-	CommittedOffset int
-	LogEntries      []LogEntry
-}
-
-type LogEntry struct {
-	Offset  int
-	Message int
-}
-
 func main() {
 	node := maelstrom.NewNode()
-	safeLogs := ThreadSafeLog{logs: make(map[string]*Log)}
+	kv := maelstrom.NewLinKV(node)
+	ctx := context.Background()
 
 	node.Handle("send", func(msg maelstrom.Message) error {
-		safeLogs.mu.Lock()
-		defer safeLogs.mu.Unlock()
-
 		var body SendRequestBody
 
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
@@ -87,24 +73,37 @@ func main() {
 		
 		var offset int
 
-		// Append entry to existing log, otherwise create new log
-		if log, ok := safeLogs.logs[body.Key]; ok {
-			offset = log.LogEntries[len(log.LogEntries)-1].Offset + 1 // 1 higher than prev offset
-			log.LogEntries = append(log.LogEntries, LogEntry{
-				Offset: offset, 
-				Message: body.Message,
-			})
-		} else {
-			offset = (len(safeLogs.logs) + 1) * 1000
-			safeLogs.logs[body.Key] = &Log{
-				CommittedOffset: offset, // TODO: might need to be offset - 1
-				LogEntries: []LogEntry{
-					{
-						Offset: offset,
-						Message: body.Message,
-					},
-				},
+		// Step 1: Retrieve highest offset for this key (-1 if it doesn't exist) then increment it
+		offsetKey := fmt.Sprintf("%s/highest_offset", body.Key)
+		for {
+			oldOffset, err := kv.ReadInt(ctx, offsetKey)
+
+			if err != nil {
+				// If key doesn't exist oldValue is 0
+				var rpcErr *maelstrom.RPCError
+				if errors.As(err, &rpcErr) && rpcErr.Code == maelstrom.KeyDoesNotExist {
+					oldOffset = -1
+				} else {
+					return err
+				}
 			}
+
+			// Increment old offset by 1
+			err = kv.CompareAndSwap(ctx, offsetKey, oldOffset, oldOffset + 1, true)
+
+			if err == nil {
+				offset = oldOffset + 1
+				break
+			}
+		}
+
+		// Step 2: Write the message as a new key-value pair with the updated offset
+		logEntryKey := fmt.Sprintf("%s/data/%d", body.Key, offset)
+
+		err := kv.Write(ctx, logEntryKey, body.Message)
+
+		if err != nil {
+			return err
 		}
 
 		return node.Reply(msg, SendResponseBody{
@@ -114,9 +113,6 @@ func main() {
 	})
 
 	node.Handle("poll", func(msg maelstrom.Message) error {
-		safeLogs.mu.Lock()
-		defer safeLogs.mu.Unlock()
-
 		var body PollRequestBody
 
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
@@ -126,27 +122,41 @@ func main() {
 		messages := make(map[string][][]int)
 
 		// Collect messages starting from given offset for each log
-		for key, offset := range body.Offsets {
+		for key, startOffset := range body.Offsets {
 			logMessages := [][]int{}
 
-			if log, ok := safeLogs.logs[key]; ok {
+			// Read highest offset for key
+			// Ignore this loop iteration if key doesnt exist
+			offsetKey := fmt.Sprintf("%s/highest_offset", key)
+
+			highestOffset, err := kv.ReadInt(ctx, offsetKey)
+
+			if err == nil {
 				count := 0
 
-				// Collect up to 3 messages from log starting from given offset
-				for _, entry := range log.LogEntries {
-					if entry.Offset >= offset {
-						logMessages = append(logMessages, []int{entry.Offset, entry.Message})
+				// Iterate through all keys in offset range (startOffset, highestOffset), appending up to three to list
+				for i := startOffset; i <= highestOffset; i++ {
+					logEntryKey := fmt.Sprintf("%s/data/%d", key, i)
 
-						count += 1
-						if count == 3 {
-							break
+					val, err := kv.Read(ctx, logEntryKey)
+
+					if err == nil {
+						if msg, ok := val.(int); ok {
+							logMessages = append(logMessages, []int{i, msg})
+							count += 1
+
+							if count == 3 {
+								break
+							}
 						}
 					}
 				}
 			}
-
+		
 			messages[key] = logMessages
 		} 
+
+		// Collect up to three messages 
 
 		return node.Reply(msg, PollResponseBody{
 			Type: "poll_ok",
@@ -155,9 +165,6 @@ func main() {
 	})
 
 	node.Handle("commit_offsets", func(msg maelstrom.Message) error {
-		safeLogs.mu.Lock()
-		defer safeLogs.mu.Unlock()
-
 		var body CommitOffsetsRequestBody
 
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
@@ -166,9 +173,27 @@ func main() {
 
 		// Set the committed offset for each key, if it exists
 		// Keep old committed offset if it is greater than the new offset
-		for key, offset := range body.Offsets {
-			if log, ok := safeLogs.logs[key]; ok {
-				log.CommittedOffset = max(log.CommittedOffset, offset) // TODO: idk if you need to remember the old committed offset
+		for key, newOffset := range body.Offsets {
+			committedOffsetKey := fmt.Sprintf("%s/committed_offset", key)
+
+			for {
+				oldCommittedOffset, err := kv.ReadInt(ctx, committedOffsetKey)
+
+				if err != nil {
+					var rpcErr *maelstrom.RPCError
+					if errors.As(err, &rpcErr) && rpcErr.Code == maelstrom.KeyDoesNotExist {
+						oldCommittedOffset = 0
+					} else {
+						return err
+					}
+				}
+
+				// New committed offset is greater of old and new
+				err = kv.CompareAndSwap(ctx, committedOffsetKey, oldCommittedOffset, max(oldCommittedOffset, newOffset), true)
+
+				if err == nil {
+					break
+				}
 			}
 		}
 
@@ -178,9 +203,6 @@ func main() {
 	})
 
 	node.Handle("list_committed_offsets", func(msg maelstrom.Message) error {
-		safeLogs.mu.Lock()
-		defer safeLogs.mu.Unlock()
-
 		var body ListCommittedOffsetsRequestBody
 
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
@@ -191,8 +213,11 @@ func main() {
 
 		// Extract committed offset from each given key, if it exists
 		for _, key := range body.Keys {
-			if log, ok := safeLogs.logs[key]; ok {
-				offsets[key] = log.CommittedOffset
+			committedOffsetKey := fmt.Sprintf("%s/committed_offset", key)
+			committedOffset, err := kv.ReadInt(ctx, committedOffsetKey)
+
+			if err == nil {
+				offsets[key] = committedOffset
 			}
 		}
 
