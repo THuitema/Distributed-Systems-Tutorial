@@ -3,4 +3,5 @@ maelstrom-unique-ids/maelstrom-unique-ids
 maelstrom-broadcast/maelstrom-broadcast
 maelstrom-counter/maelstrom-counter
 maelstrom-kafka/maelstrom-kafka
+maelstrom-txn/maelstrom-txn
 store/
